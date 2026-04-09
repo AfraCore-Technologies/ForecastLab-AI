@@ -14,6 +14,7 @@ class Hyperparameters:
     """
 
     frequency: str = "daily"
+    seasonality: str = "auto"
     prophet: dict = field(
         default_factory=lambda: {
             "uncertainty_samples": 1000,
@@ -21,7 +22,6 @@ class Hyperparameters:
             "growth": "auto",
             "changepoint_prior_scale": 0.05,
             "changepoint_range": 0.8,
-            "seasonalities": "auto",
             "seasonality_mode": "additive",
             "seasonality_prior_scale": 10.0,
             "exogenous": "",
