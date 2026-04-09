@@ -6,6 +6,14 @@ from pathlib import Path
 
 from src.core.predictor import Predictor
 from src.core.trainer import Trainer
+from src.utils.settings import (
+    HYPERPARAMETERS_PATH,
+    MODEL_OUTPUT_PATH,
+    PREDICTIONS_OUTPUT_PATH,
+    TEST_DATA_PATH,
+    TRAIN_DATA_PATH,
+    ensure_directories,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -19,32 +27,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     train_parser = subparsers.add_parser("train", help="Train a forecasting model")
     train_parser.add_argument(
         "--hyperparameters",
-        required=True,
+        default=str(HYPERPARAMETERS_PATH),
         type=str,
         help="Path to hyperparameters json file",
     )
     train_parser.add_argument(
         "--data",
-        required=True,
+        default=str(TRAIN_DATA_PATH),
         type=str,
         help="Path to training data file (.csv or .parquet)",
     )
     train_parser.add_argument(
         "--output",
-        required=True,
+        default=str(MODEL_OUTPUT_PATH),
         type=str,
-        help="Output artifact path (.pkl, .csv, .parquet)",
+        help="Output artifact path",
     )
 
     predict_parser = subparsers.add_parser("predict", help="Run predictions from a trained artifact")
     predict_parser.add_argument(
         "--artifact",
-        required=True,
+        default=str(MODEL_OUTPUT_PATH),
         type=str,
         help="Path to trained artifact (.pkl)",
     )
     predict_parser.add_argument(
         "--data",
+        default=str(TEST_DATA_PATH),
         type=str,
         help="Path to prediction input file (.csv or .parquet)",
     )
@@ -60,15 +69,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     predict_parser.add_argument(
         "--output",
-        required=True,
+        default=str(PREDICTIONS_OUTPUT_PATH),
         type=str,
-        help="Output predictions path (.csv, .parquet, .pkl)",
+        help="Output predictions path",
     )
 
     return parser
 
 
 def run_train(args: argparse.Namespace) -> None:
+    ensure_directories()
     trainer = Trainer.from_hyperparameters_file(Path(args.hyperparameters))
     artifact = trainer.train_from_file(Path(args.data))
     trainer.save_output(artifact, Path(args.output))
@@ -76,6 +86,7 @@ def run_train(args: argparse.Namespace) -> None:
 
 
 def run_predict(args: argparse.Namespace) -> None:
+    ensure_directories()
     predictor = Predictor.from_file(Path(args.artifact))
     predictions = predictor.predict_from_file(
         data_path=Path(args.data) if args.data else None,
