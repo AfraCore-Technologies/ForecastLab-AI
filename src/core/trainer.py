@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
-from ..utils.hyperparameters import Hyperparameters
+from .prepare import Prepare
 from ..utils.prophet.model import ProphetModel
 from ..utils.settings import (
     HYPERPARAMETERS_PATH,
@@ -51,25 +51,7 @@ class Trainer:
         path_to_hyperparameters_file: str | Path = HYPERPARAMETERS_PATH,
         logger: Optional[logging.Logger] = None,
     ) -> "Trainer":
-        path = Path(path_to_hyperparameters_file)
-
-        if hasattr(Hyperparameters, "parse"):
-            parsed = Hyperparameters.parse(str(path))
-            if hasattr(parsed, "to_dict"):
-                hyperparameters = parsed.to_dict()
-            else:
-                hyperparameters = vars(parsed)
-        elif hasattr(Hyperparameters, "from_file"):
-            parsed = Hyperparameters.from_file(path)
-            if hasattr(parsed, "to_dict"):
-                hyperparameters = parsed.to_dict()
-            elif hasattr(parsed, "data"):
-                hyperparameters = parsed.data
-            else:
-                hyperparameters = vars(parsed)
-        else:
-            hyperparameters = json.loads(path.read_text(encoding="utf-8"))
-
+        hyperparameters = Prepare.load_hyperparameters(path_to_hyperparameters_file)
         return cls(hyperparameters=hyperparameters, logger=logger)
 
     def _freq_alias(self) -> str:
@@ -91,22 +73,7 @@ class Trainer:
         return selected
 
     def _prepare_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        if not isinstance(data, pd.DataFrame):
-            raise TypeError("data must be a pandas DataFrame")
-
-        required = {"ds", "y"}
-        missing = required - set(data.columns)
-        if missing:
-            raise ValueError(f"Missing required columns: {sorted(missing)}")
-
-        prepared = data.copy()
-        prepared["ds"] = pd.to_datetime(prepared["ds"]).dt.tz_localize(None)
-        prepared["y"] = pd.to_numeric(prepared["y"], errors="coerce")
-
-        if prepared["y"].isna().any():
-            raise ValueError("Column 'y' contains invalid numeric values.")
-
-        return prepared.sort_values("ds").reset_index(drop=True)
+        return Prepare.prepare_training_data(data)
 
     def _get_prophet_kwargs(self) -> Dict[str, Any]:
         raw = dict(self.fbpt_hyperparameters or {})
@@ -246,17 +213,7 @@ class Trainer:
         return self._train(data)
 
     def train_from_file(self, data_path: str | Path = TRAIN_DATA_PATH) -> Dict[str, Any]:
-        path = Path(data_path)
-        if not path.exists():
-            raise FileNotFoundError(path)
-
-        if path.suffix.lower() == ".csv":
-            data = pd.read_csv(path)
-        elif path.suffix.lower() in [".parquet", ".pq"]:
-            data = pd.read_parquet(path)
-        else:
-            raise ValueError("Supported input formats are .csv and .parquet")
-
+        data = Prepare.load_training_data(data_path)
         return self.train(data)
 
     def save_output(self, artifact: Dict[str, Any], output_path: str | Path = MODEL_OUTPUT_PATH) -> None:

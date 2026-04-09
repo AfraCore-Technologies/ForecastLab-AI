@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from .prepare import Prepare
 from ..utils.prophet.model import ProphetModel
 from ..utils.settings import (
     MODEL_OUTPUT_PATH,
@@ -69,16 +70,7 @@ class Predictor:
         }.get(self.frequency, "D")
 
     def _read_data(self, data_path: str | Path) -> pd.DataFrame:
-        path = Path(data_path)
-        if not path.exists():
-            raise FileNotFoundError(path)
-
-        if path.suffix.lower() == ".csv":
-            return pd.read_csv(path)
-        if path.suffix.lower() in [".parquet", ".pq"]:
-            return pd.read_parquet(path)
-
-        raise ValueError("Supported input formats are .csv and .parquet")
+        return Prepare.load_prediction_data(data_path)
 
     def _get_first_model(self) -> Any:
         if not self.models:
@@ -159,11 +151,8 @@ class Predictor:
         frames: list[pd.DataFrame] = []
 
         if data is not None:
-            if "ds" not in data.columns:
-                raise ValueError("Prediction data must contain a 'ds' column for Prophet.")
-
-            data = data.copy()
-            data["ds"] = pd.to_datetime(data["ds"])
+            data = Prepare.prepare_prediction_data(data)
+            data = Prepare.validate_prophet_input(data, require_target=False)
 
             if "TSId" in data.columns and len(self.models) > 1:
                 for ts_id, group in data.groupby("TSId", sort=False):
@@ -220,6 +209,8 @@ class Predictor:
         return result[ordered]
 
     def _predict_xgboost(self, data: pd.DataFrame) -> pd.DataFrame:
+        data = Prepare.prepare_prediction_data(data)
+        data = Prepare.validate_xgboost_input(data, require_target=False)
         model = self._get_first_model()
         expected_columns = self._get_xgb_feature_names(model)
         features = self._build_xgboost_features(data.copy(), expected_columns=expected_columns or None)
