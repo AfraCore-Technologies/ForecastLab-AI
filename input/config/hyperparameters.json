@@ -41,5 +41,6 @@
     },
     "probabilistic_forecast": {
         "quantiles": []
-    }
+    },
+    "seasonality": "auto"
 }
