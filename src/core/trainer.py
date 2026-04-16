@@ -115,57 +115,39 @@ class Trainer:
                 raw["objective"] = "reg:squarederror"
 
         return raw
+    
+    def apply_level(self, data: pd.DataFrame, method: str) -> pd.DataFrame:
+        tr = data[data["TestIndicator"] == 0]
+        ts = data[data["TestIndicator"] == 1]
+        if "TSId" not in data.columns:
+            raise KeyError("input data missing TSId !")
+        elif method not in ["mean", "median"]:
+            raise ValueError(f"level method {method} is not supported !!")
+        else:
+            level_map = tr.groupby("TSId")["y"].transform(method).to_dict()
+            tr["level"] = tr["TSId"].map(level_map)
+            ts["level"] = tr["TSId"].map(level_map)
+            ts["level"] = ts["level"].fillna(tr["y"].transform(method))
+        return pd.concat([tr,ts], ignore_index=True)
 
     def _build_xgboost_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        features = pd.DataFrame(index=data.index)
-
-        ds = pd.to_datetime(data["ds"])
-        features["year"] = ds.dt.year
-        features["month"] = ds.dt.month
-        features["day"] = ds.dt.day
-        features["dayofweek"] = ds.dt.dayofweek
-        features["quarter"] = ds.dt.quarter
-        features["weekofyear"] = ds.dt.isocalendar().week.astype(int)
-
         exogenous = (self.xgb_hyperparameters or {}).get("exogenous", {}) or {}
         numerical = [col for col in exogenous.get("numerical", []) if col in data.columns]
         categorical = [col for col in exogenous.get("categorical", []) if col in data.columns]
-
-        if numerical:
-            features = pd.concat([features, data[numerical]], axis=1)
-
-        if categorical:
-            encoded = pd.get_dummies(data[categorical].astype("category"), prefix=categorical, dummy_na=True)
-            features = pd.concat([features, encoded], axis=1)
-
-        features = features.fillna(0)
-
-        if features.empty:
-            raise ValueError("No features available for XGBoost training.")
+        level_method = (self.xgb_hyperparameters or {}).get("level_method", {})
+        features = self.apply_level(data, level_method)
+        
 
         return features
 
-    def apply_prophet_model(self, ts_id: Any, group: pd.DataFrame) -> pd.DataFrame:
+    def apply_prophet_model(self, group: pd.DataFrame) -> pd.DataFrame:
         model = ProphetModel(model_kwargs=self._get_prophet_kwargs())
-        train_df = group[["ds", "y"]].copy()
-
+        train_df = group[group["TestIndicator"] == 0].copy()
+        future_df = group[group["TestIndicator"] == 1].copy()
         model.fit(train_df)
-        forecast = model.predict(future_df=train_df[["ds"]], freq=self._freq_alias())
+        forecast = model.predict(future_df=future_df, freq=self._freq_alias())
 
-        cols = ["ds", "yhat"]
-        for extra in ["yhat_lower", "yhat_upper", "trend"]:
-            if extra in forecast.columns:
-                cols.append(extra)
-
-        result = forecast[cols].copy()
-        result["TSId"] = ts_id
-        result = result.merge(train_df, on="ds", how="left")
-
-        ordered_cols = ["TSId", "ds", "y"]
-        ordered_cols += [c for c in ["yhat", "yhat_lower", "yhat_upper", "trend"] if c in result.columns]
-        result = result[ordered_cols]
-
-        return result
+        return forecast
 
     def apply_xgboost_model(self, data: pd.DataFrame) -> pd.DataFrame:
         features = self._build_xgboost_features(data)
