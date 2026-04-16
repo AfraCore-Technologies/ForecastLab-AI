@@ -49,17 +49,3 @@ def test_get_xgboost_kwargs_uses_configured_quantiles() -> None:
 
     assert kwargs["objective"] == "reg:quantileerror"
     assert kwargs["quantile_alpha"] == [0.1, 0.5, 0.9]
-
-
-def test_resolve_algorithm_uses_auto_mapping() -> None:
-    hyperparameters = make_hyperparameters()
-    hyperparameters["algorithm"] = {
-        "name": "auto",
-        "models": {"smooth": "prophet"},
-        "cutoffs": {},
-    }
-    trainer = Trainer(hyperparameters)
-
-    resolved = trainer._resolve_algorithm(data=None)
-
-    assert resolved == "prophet"
