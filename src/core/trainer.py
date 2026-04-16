@@ -145,7 +145,7 @@ class Trainer:
 
         return features
 
-    def apply_prophet_model(self, ts_id: Any, group: pd.DataFrame) -> tuple[ProphetModel, pd.DataFrame]:
+    def apply_prophet_model(self, ts_id: Any, group: pd.DataFrame) -> pd.DataFrame:
         model = ProphetModel(model_kwargs=self._get_prophet_kwargs())
         train_df = group[["ds", "y"]].copy()
 
@@ -165,9 +165,9 @@ class Trainer:
         ordered_cols += [c for c in ["yhat", "yhat_lower", "yhat_upper", "trend"] if c in result.columns]
         result = result[ordered_cols]
 
-        return model, result
+        return result
 
-    def apply_xgboost_model(self, data: pd.DataFrame) -> tuple[XGBoostModel, pd.DataFrame]:
+    def apply_xgboost_model(self, data: pd.DataFrame) -> pd.DataFrame:
         features = self._build_xgboost_features(data)
         target = data["y"]
 
@@ -183,44 +183,36 @@ class Trainer:
         if "TSId" in pred_df.columns:
             ordered_cols = ["TSId"] + ordered_cols
 
-        return model, pred_df[ordered_cols]
+        return pred_df[ordered_cols]
 
     def _train(self, data: Any) -> Dict[str, Any]:
         data = self._prepare_data(data)
-        algorithm = self._resolve_algorithm(data)
 
         artifact: Dict[str, Any] = {
-            "algorithm": algorithm,
+            "algorithm": self.algorithm,
             "frequency": self.frequency,
             "input_data_header": list(data.columns),
             "predictions": None,
-            "models": {},
         }
-
-        if algorithm == "prophet":
-            if "TSId" in data.columns:
-                forecast_list = []
-                for ts_id, group in data.groupby("TSId", sort=False):
-                    self.logger.info("Training Prophet for TSId=%s", ts_id)
-                    model, forecast = self.apply_prophet_model(ts_id, group.copy())
-                    artifact["models"][str(ts_id)] = model
-                    forecast_list.append(forecast)
-                artifact["predictions"] = pd.concat(forecast_list, ignore_index=True)
-            else:
-                self.logger.info("Training Prophet for single series")
-                model, forecast = self.apply_prophet_model("series_0", data.copy())
-                artifact["models"]["series_0"] = model
-                artifact["predictions"] = forecast
-
-        elif algorithm == "xgboost":
+        forecast = pd.DataFrame()
+        if self.algorithm in ["auto", "xgboost"]:
             self.logger.info("Training XGBoost")
-            model, forecast = self.apply_xgboost_model(data.copy())
-            artifact["models"]["global"] = model
-            artifact["predictions"] = forecast
+            forecast = self.apply_xgboost_model(data.copy())
+            if self.algorithm == "xgboost":
+                artifact["predictions"] = forecast
+                return artifact
 
-        else:
-            raise ValueError(f"Unsupported algorithm: {algorithm}")
+        
+        if "TSId" not in data.columns:
+                raise KeyError("TSId column must be provided!!")
+        forecast_list = []
+        for ts_id, group in data.groupby("TSId", sort=False):
+            self.logger.info("Training Prophet for TSId=%s", ts_id)
+            forecast = self.apply_prophet_model(ts_id, group.copy())
+            forecast_list.append(forecast)
 
+        artifact["predictions"] = pd.concat(forecast_list + list(forecast), ignore_index=True)
+        
         return artifact
 
     def train(self, data: pd.DataFrame) -> Dict[str, Any]:
