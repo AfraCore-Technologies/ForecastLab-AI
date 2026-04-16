@@ -6,7 +6,7 @@ __all__ = ["model_selection"]
 
 
 
-def model_selection(timeseries:pd.series, cutoffs: dict, models:dict) -> tuple[str,str]:
+def model_selection(timeseries:pd.Series, cutoffs: dict, models:dict) -> tuple[str,str]:
     """
     select the appropriate model based on demand caracteristics.
 
