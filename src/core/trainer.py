@@ -19,7 +19,7 @@ from ..utils.settings import (
 )
 from ..utils.xgboost.model import XGBoostModel
 from ..utils.modeling import model_selection
-
+from sklearn.preprocessing import TargetEncoder
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -129,15 +129,24 @@ class Trainer:
             ts["level"] = tr["TSId"].map(level_map)
             ts["level"] = ts["level"].fillna(tr["y"].transform(method))
         return pd.concat([tr,ts], ignore_index=True)
+    
+    def apply_encoding(self, data: pd.DataFrame, column: str) -> pd.Series:
+        encoder = TargetEncoder()
+        encoded = encoder.fit_transform(data[[column]], data["y"])
+        return encoded
+    
+    def apply_seaonality(self, data: pd.DataFrame) -> pd.DataFrame:
+        
 
     def _build_xgboost_features(self, data: pd.DataFrame) -> pd.DataFrame:
         exogenous = (self.xgb_hyperparameters or {}).get("exogenous", {}) or {}
         numerical = [col for col in exogenous.get("numerical", []) if col in data.columns]
         categorical = [col for col in exogenous.get("categorical", []) if col in data.columns]
         level_method = (self.xgb_hyperparameters or {}).get("level_method", {})
-        features = self.apply_level(data, level_method)
-        
-
+        features = self.apply_level(data.copy(), level_method)
+        for col in categorical:
+            features[col] = self.apply_encoding(features.copy(), col)
+        features = features.self.apply_seasonality(data.copy())
         return features
 
     def apply_prophet_model(self, group: pd.DataFrame) -> pd.DataFrame:
