@@ -10,14 +10,12 @@ from typing import Any, Optional
 import pandas as pd
 
 from .prepare import Prepare
-from ..utils.prophet.model import ProphetModel
 from ..utils.settings import (
     MODEL_OUTPUT_PATH,
     PREDICTIONS_OUTPUT_PATH,
     TEST_DATA_PATH,
     ensure_directories,
 )
-from ..utils.xgboost.model import XGBoostModel
 
 
 logging.basicConfig(level=logging.INFO)
@@ -32,20 +30,39 @@ class Predictor:
         if isinstance(artifact, dict):
             self.algorithm = str(artifact.get("algorithm", "")).strip().lower()
             self.frequency = str(artifact.get("frequency", "daily")).strip().lower()
-            self.models = artifact.get("models", {}) or {}
-        elif isinstance(artifact, ProphetModel):
-            self.algorithm = "prophet"
+            predictions = artifact.get("predictions")
+        elif isinstance(artifact, pd.DataFrame):
+            self.algorithm = ""
             self.frequency = "daily"
-            self.models = {"series_0": artifact}
-        elif isinstance(artifact, XGBoostModel):
-            self.algorithm = "xgboost"
-            self.frequency = "daily"
-            self.models = {"global": artifact}
+            predictions = artifact
         else:
             raise TypeError("Unsupported artifact type for predictor.")
 
-        if self.algorithm not in {"prophet", "xgboost"}:
-            raise ValueError("Artifact must contain a supported algorithm: prophet or xgboost.")
+        if not isinstance(predictions, pd.DataFrame):
+            raise ValueError("Artifact must contain a pandas DataFrame under 'predictions'.")
+
+        self.predictions = predictions.copy()
+        self.predictions.columns = [str(column).strip() for column in self.predictions.columns]
+        if "ds" in self.predictions.columns:
+            self.predictions["ds"] = pd.to_datetime(self.predictions["ds"], errors="coerce")
+
+    @staticmethod
+    def _normalize_prediction_input(data: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError("data must be a pandas DataFrame")
+        if data.empty:
+            raise ValueError("data must not be empty")
+
+        prepared = data.copy()
+        prepared.columns = [str(column).strip() for column in prepared.columns]
+        if "ds" not in prepared.columns:
+            raise ValueError("Missing required columns: ['ds']")
+
+        prepared["ds"] = pd.to_datetime(prepared["ds"], errors="coerce")
+        if prepared["ds"].isna().any():
+            raise ValueError("Column 'ds' contains invalid datetime values.")
+
+        return prepared
 
     @classmethod
     def from_file(
@@ -57,171 +74,35 @@ class Predictor:
         if not path.exists():
             raise FileNotFoundError(path)
 
-        with open(path, "rb") as file:
-            artifact = pickle.load(file)
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            artifact = Prepare.read_dataframe(path)
+        elif suffix in {".parquet", ".pq"}:
+            artifact = Prepare.read_dataframe(path)
+        else:
+            with open(path, "rb") as file:
+                artifact = pickle.load(file)
 
         return cls(artifact=artifact, logger=logger)
-
-    def _freq_alias(self) -> str:
-        return {
-            "daily": "D",
-            "weekly": "W",
-            "monthly": "MS",
-        }.get(self.frequency, "D")
 
     def _read_data(self, data_path: str | Path) -> pd.DataFrame:
         return Prepare.load_prediction_data(data_path)
 
-    def _get_first_model(self) -> Any:
-        if not self.models:
-            raise ValueError("No models found in artifact.")
-        return next(iter(self.models.values()))
 
-    def _get_xgb_feature_names(self, model: XGBoostModel) -> list[str]:
-        feature_names: list[str] = []
+    def _match_predictions(self, data: pd.DataFrame) -> pd.DataFrame:
+        requested = self._normalize_prediction_input(data)
+        key_columns = [column for column in ["TSId", "ds"] if column in requested.columns and column in self.predictions.columns]
 
-        try:
-            names = getattr(model.model, "feature_names_in_", None)
-            if names is not None:
-                feature_names = list(names)
-        except Exception:
-            feature_names = []
+        if not key_columns:
+            if len(requested) != len(self.predictions):
+                raise ValueError("Prediction input must share 'ds' or 'TSId' columns with the artifact predictions.")
+            return self.predictions.reset_index(drop=True).copy()
 
-        if not feature_names:
-            try:
-                booster = model.model.get_booster()
-                names = booster.feature_names
-                if names:
-                    feature_names = list(names)
-            except Exception:
-                feature_names = []
-
-        return feature_names
-
-    def _build_xgboost_features(self, data: pd.DataFrame, expected_columns: Optional[list[str]] = None) -> pd.DataFrame:
-        if "ds" not in data.columns:
-            raise ValueError("XGBoost prediction data must contain a 'ds' column.")
-
-        ds = pd.to_datetime(data["ds"])
-        features = pd.DataFrame(index=data.index)
-        features["year"] = ds.dt.year
-        features["month"] = ds.dt.month
-        features["day"] = ds.dt.day
-        features["dayofweek"] = ds.dt.dayofweek
-        features["quarter"] = ds.dt.quarter
-        features["weekofyear"] = ds.dt.isocalendar().week.astype(int)
-
-        ignored = {"ds", "y", "TSId"}
-        extra = [col for col in data.columns if col not in ignored]
-
-        if extra:
-            numeric_cols = [col for col in extra if pd.api.types.is_numeric_dtype(data[col])]
-            categorical_cols = [col for col in extra if col not in numeric_cols]
-
-            if numeric_cols:
-                features = pd.concat([features, data[numeric_cols]], axis=1)
-
-            if categorical_cols:
-                encoded = pd.get_dummies(
-                    data[categorical_cols].astype("category"),
-                    prefix=categorical_cols,
-                    dummy_na=True,
-                )
-                features = pd.concat([features, encoded], axis=1)
-
-        features = features.fillna(0)
-
-        if expected_columns:
-            for col in expected_columns:
-                if col not in features.columns:
-                    features[col] = 0
-            features = features[expected_columns]
-
-        return features
-
-    def _predict_prophet(
-        self,
-        data: Optional[pd.DataFrame] = None,
-        periods: Optional[int] = None,
-        include_history: bool = False,
-    ) -> pd.DataFrame:
-        if not self.models:
-            raise ValueError("No Prophet models available in artifact.")
-
-        frames: list[pd.DataFrame] = []
-
-        if data is not None:
-            data = Prepare.prepare_prediction_data(data)
-            data = Prepare.validate_prophet_input(data, require_target=False)
-
-            if "TSId" in data.columns and len(self.models) > 1:
-                for ts_id, group in data.groupby("TSId", sort=False):
-                    key = str(ts_id)
-                    if key not in self.models:
-                        self.logger.warning("Skipping unknown TSId=%s", ts_id)
-                        continue
-
-                    model = self.models[key]
-                    forecast = model.predict(
-                        future_df=group[["ds"]].copy(),
-                        freq=self._freq_alias(),
-                        include_history=include_history,
-                    )
-                    forecast["TSId"] = ts_id
-                    if "y" in group.columns:
-                        forecast = forecast.merge(group[["ds", "y"]], on="ds", how="left")
-                    frames.append(forecast)
-            else:
-                model = self._get_first_model()
-                forecast = model.predict(
-                    future_df=data[["ds"]].copy(),
-                    freq=self._freq_alias(),
-                    include_history=include_history,
-                )
-                if "TSId" in data.columns:
-                    forecast = forecast.merge(data[["ds", "TSId"]], on="ds", how="left")
-                if "y" in data.columns:
-                    forecast = forecast.merge(data[["ds", "y"]], on="ds", how="left")
-                frames.append(forecast)
-
-        else:
-            if periods is None:
-                raise ValueError("For Prophet, provide either prediction data or periods.")
-
-            for key, model in self.models.items():
-                forecast = model.predict(
-                    periods=periods,
-                    freq=self._freq_alias(),
-                    include_history=include_history,
-                )
-                if len(self.models) > 1:
-                    forecast["TSId"] = key
-                frames.append(forecast)
-
-        if not frames:
-            raise ValueError("No predictions were produced.")
-
-        result = pd.concat(frames, ignore_index=True)
-
-        preferred = ["TSId", "ds", "y", "yhat", "yhat_lower", "yhat_upper", "trend"]
-        ordered = [col for col in preferred if col in result.columns]
-        ordered += [col for col in result.columns if col not in ordered]
-        return result[ordered]
-
-    def _predict_xgboost(self, data: pd.DataFrame) -> pd.DataFrame:
-        data = Prepare.prepare_prediction_data(data)
-        data = Prepare.validate_xgboost_input(data, require_target=False)
-        model = self._get_first_model()
-        expected_columns = self._get_xgb_feature_names(model)
-        features = self._build_xgboost_features(data.copy(), expected_columns=expected_columns or None)
-
-        result = data.copy()
-        result["yhat"] = model.predict(features)
-
-        preferred = ["TSId", "ds", "y", "yhat"]
-        ordered = [col for col in preferred if col in result.columns]
-        ordered += [col for col in result.columns if col not in ordered]
-        return result[ordered]
+        lookup = requested[key_columns].copy()
+        lookup["_request_order"] = range(len(lookup))
+        matched = lookup.merge(self.predictions, on=key_columns, how="left", sort=False)
+        matched = matched.sort_values("_request_order").drop(columns=["_request_order"]).reset_index(drop=True)
+        return matched
 
     def predict(
         self,
@@ -229,15 +110,15 @@ class Predictor:
         periods: Optional[int] = None,
         include_history: bool = False,
     ) -> pd.DataFrame:
-        if self.algorithm == "prophet":
-            return self._predict_prophet(data=data, periods=periods, include_history=include_history)
+        if periods is not None:
+            self.logger.warning("Ignoring 'periods'; predictions are loaded from the trained artifact.")
+        if include_history:
+            self.logger.warning("Ignoring 'include_history'; predictions are loaded from the trained artifact.")
 
-        if self.algorithm == "xgboost":
-            if data is None:
-                raise ValueError("XGBoost prediction requires input data.")
-            return self._predict_xgboost(data=data)
+        if data is None:
+            return self.predictions.copy()
 
-        raise ValueError(f"Unsupported algorithm: {self.algorithm}")
+        return self._match_predictions(data)
 
     def predict_from_file(
         self,

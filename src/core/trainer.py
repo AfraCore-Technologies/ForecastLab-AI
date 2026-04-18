@@ -193,6 +193,7 @@ class Trainer:
     def apply_seasonality(self, data: pd.DataFrame) -> pd.DataFrame:
         seasonalities = self.parse_seasonality(self.seasonality)
         data = self.add_seasonality(seasonalities, data)
+        return data
 
 
     def _build_xgboost_features(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -203,7 +204,9 @@ class Trainer:
         features = self.apply_level(data.copy(), level_method)
         for col in categorical:
             features[col] = self.apply_encoding(features.copy(), col)
-        features = self.apply_seasonality(data.copy())
+        features = self.apply_seasonality(features.copy())
+        desired_cols = ["level"] + [col for col in features.columns if col.startswith("seasonality_")] + numerical +categorical
+        features = features[desired_cols]
         return features
 
     def apply_prophet_model(self, group: pd.DataFrame) -> pd.DataFrame:
