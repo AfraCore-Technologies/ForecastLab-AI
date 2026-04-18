@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "forecastlab-ai"
-version = "0.1.0"
+version = "0.1.1"
 description = "CLI workflow for preparing data, training forecasting models, and generating predictions."
 authors = ["Feres Darouich"]
 readme = "README.md"

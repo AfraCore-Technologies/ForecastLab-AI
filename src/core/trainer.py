@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pandas as pd
+import numpy as np
 
 from .prepare import Prepare
 from ..utils.prophet.model import ProphetModel
@@ -18,7 +19,8 @@ from ..utils.settings import (
     ensure_directories,
 )
 from ..utils.xgboost.model import XGBoostModel
-
+from ..utils.modeling import model_selection
+from sklearn.preprocessing import TargetEncoder
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -61,14 +63,11 @@ class Trainer:
             "monthly": "MS",
         }[self.frequency]
 
-    def _resolve_algorithm(self, data: pd.DataFrame) -> str:
+    def _resolve_algorithm(self, series: pd.series) -> str:
         if self.algorithm != "auto":
             return self.algorithm
 
-        selected = str((self.models or {}).get("smooth", "prophet")).strip().lower()
-        if selected not in ["prophet", "xgboost"]:
-            selected = "prophet"
-
+        selected = str(model_selection(series, self.cutoffs, self.models)).strip().lower()
         self.logger.info("Algorithm set to auto. Resolved to '%s'.", selected)
         return selected
 
@@ -117,59 +116,109 @@ class Trainer:
                 raw["objective"] = "reg:squarederror"
 
         return raw
+    
+    def apply_level(self, data: pd.DataFrame, method: str) -> pd.DataFrame:
+        tr = data[data["TestIndicator"] == 0]
+        ts = data[data["TestIndicator"] == 1]
+        if "TSId" not in data.columns:
+            raise KeyError("input data missing TSId !")
+        elif method not in ["mean", "median"]:
+            raise ValueError(f"level method {method} is not supported !!")
+        else:
+            level_map = tr.groupby("TSId")["y"].agg(method).to_dict()
+            tr["level"] = tr["TSId"].map(level_map)
+            ts["level"] = tr["TSId"].map(level_map)
+            ts["level"] = ts["level"].fillna(tr["y"].agg(method))
+        return pd.concat([tr,ts], ignore_index=True)
+    
+    def apply_encoding(self, data: pd.DataFrame, column: str) -> pd.Series:
+        encoder = TargetEncoder()
+        encoded = encoder.fit_transform(data[[column]], data["y"])
+        return encoded
+    
+    def parse_seasonality(self,seas: str) -> list[tuple]:
+        if seas.lower() == "auto":
+            defaults = {
+                "daily": [(365,5), (30.5,3), (7,2)],
+                "weekly": [(52,5), (4.5,2)],
+                "monthly": [(12, 3)],
+            }
+            return defaults[self.frequency]
+        else:
+            terms = []
+            seas_terms = seas.split(",")
+            if seas_terms:
+                seasonalities = [seasonality.split("-") for seasonality in seas_terms]
+                for s in seasonalities:
+                    try:
+                        period, n_component = s
+                        terms.append(float(period), int(n_component))
+                    except:
+                        raise ValueError("Seasonalities values schema is incorrect!!")
+            return terms
+        
+    def compute_fourier(self, data: pd.DataFrame, period: float, term: int) -> pd.DataFrame:
+        data["ds"] = pd.to_datetime(data["ds"])
+        ds = data["ds"].drop_duplicates().reset_index(drop=True)
+        if self.frequency == "monthly":
+            t = (ds.dt.to_period("M").astype(int) - ds.dt.to_period("M").astype(int).min())/period
+        elif self.frequency == "weekly":
+            t = (ds.dt.to_period("W").astype(int) - ds.dt.to_period("W").astype(int).min())/period
+        elif self.frequency == "daily":
+            t = (ds - ds.min()).dt.days / period
+        else: 
+            raise ValueError("Unable to compute fourier terms. unsupported frequency !!")
+        fourier_cos = np.zeros(len(ds))
+        fourier_sin = np.zeros(len(ds))
+        fourier_cos += np.cos(2 * np.pi * term * t)
+        fourier_sin += np.sin(2 * np.pi * term * t)
+        F_component = pd.DataFrame(
+            {"ds": ds, "fourier_cos": fourier_cos, "fourier_sin": fourier_sin}
+        )
+        return F_component
+
+    def add_seasonality(self, seasonality: list, data: pd.DataFrame) -> pd.DataFrame:
+        if len(seasonality) != 0:
+            for seas in seasonality:
+                for term in range(1, seas[1] + 1):
+                    name = "seasonality_" + str(seas[0]) + "_component_" + str(term)
+                    F_compoent = self.compute_fourier(data, period= seas[0], term= term) 
+                    data[name + "_cos"] = data["ds"].map(F_compoent.set_index("ds")["fourier_cos"])
+                    data[name + "_sin"] = data["ds"].map(F_compoent.set_index("ds")["fourier_sin"])
+        else: 
+            pass
+        return data
+
+
+    def apply_seasonality(self, data: pd.DataFrame) -> pd.DataFrame:
+        seasonalities = self.parse_seasonality(self.seasonality)
+        data = self.add_seasonality(seasonalities, data)
+        return data
+
 
     def _build_xgboost_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        features = pd.DataFrame(index=data.index)
-
-        ds = pd.to_datetime(data["ds"])
-        features["year"] = ds.dt.year
-        features["month"] = ds.dt.month
-        features["day"] = ds.dt.day
-        features["dayofweek"] = ds.dt.dayofweek
-        features["quarter"] = ds.dt.quarter
-        features["weekofyear"] = ds.dt.isocalendar().week.astype(int)
-
         exogenous = (self.xgb_hyperparameters or {}).get("exogenous", {}) or {}
         numerical = [col for col in exogenous.get("numerical", []) if col in data.columns]
         categorical = [col for col in exogenous.get("categorical", []) if col in data.columns]
-
-        if numerical:
-            features = pd.concat([features, data[numerical]], axis=1)
-
-        if categorical:
-            encoded = pd.get_dummies(data[categorical].astype("category"), prefix=categorical, dummy_na=True)
-            features = pd.concat([features, encoded], axis=1)
-
-        features = features.fillna(0)
-
-        if features.empty:
-            raise ValueError("No features available for XGBoost training.")
-
+        level_method = (self.xgb_hyperparameters or {}).get("level_method", {})
+        features = self.apply_level(data.copy(), level_method)
+        for col in categorical:
+            features[col] = self.apply_encoding(features.copy(), col)
+        features = self.apply_seasonality(features.copy())
+        desired_cols = ["level"] + [col for col in features.columns if col.startswith("seasonality_")] + numerical +categorical
+        features = features[desired_cols]
         return features
 
-    def apply_prophet_model(self, ts_id: Any, group: pd.DataFrame) -> tuple[ProphetModel, pd.DataFrame]:
+    def apply_prophet_model(self, group: pd.DataFrame) -> pd.DataFrame:
         model = ProphetModel(model_kwargs=self._get_prophet_kwargs())
-        train_df = group[["ds", "y"]].copy()
-
+        train_df = group[group["TestIndicator"] == 0].copy()
+        future_df = group[group["TestIndicator"] == 1].copy()
         model.fit(train_df)
-        forecast = model.predict(future_df=train_df[["ds"]], freq=self._freq_alias())
+        forecast = model.predict(future_df=future_df, freq=self._freq_alias())
 
-        cols = ["ds", "yhat"]
-        for extra in ["yhat_lower", "yhat_upper", "trend"]:
-            if extra in forecast.columns:
-                cols.append(extra)
+        return forecast
 
-        result = forecast[cols].copy()
-        result["TSId"] = ts_id
-        result = result.merge(train_df, on="ds", how="left")
-
-        ordered_cols = ["TSId", "ds", "y"]
-        ordered_cols += [c for c in ["yhat", "yhat_lower", "yhat_upper", "trend"] if c in result.columns]
-        result = result[ordered_cols]
-
-        return model, result
-
-    def apply_xgboost_model(self, data: pd.DataFrame) -> tuple[XGBoostModel, pd.DataFrame]:
+    def apply_xgboost_model(self, data: pd.DataFrame) -> pd.DataFrame:
         features = self._build_xgboost_features(data)
         target = data["y"]
 
@@ -185,43 +234,35 @@ class Trainer:
         if "TSId" in pred_df.columns:
             ordered_cols = ["TSId"] + ordered_cols
 
-        return model, pred_df[ordered_cols]
+        return pred_df[ordered_cols]
 
     def _train(self, data: Any) -> Dict[str, Any]:
         data = self._prepare_data(data)
-        algorithm = self._resolve_algorithm(data)
 
         artifact: Dict[str, Any] = {
-            "algorithm": algorithm,
+            "algorithm": self.algorithm,
             "frequency": self.frequency,
             "input_data_header": list(data.columns),
             "predictions": None,
-            "models": {},
         }
-
-        if algorithm == "prophet":
-            if "TSId" in data.columns:
-                forecast_list = []
-                for ts_id, group in data.groupby("TSId", sort=False):
-                    self.logger.info("Training Prophet for TSId=%s", ts_id)
-                    model, forecast = self.apply_prophet_model(ts_id, group.copy())
-                    artifact["models"][str(ts_id)] = model
-                    forecast_list.append(forecast)
-                artifact["predictions"] = pd.concat(forecast_list, ignore_index=True)
-            else:
-                self.logger.info("Training Prophet for single series")
-                model, forecast = self.apply_prophet_model("series_0", data.copy())
-                artifact["models"]["series_0"] = model
-                artifact["predictions"] = forecast
-
-        elif algorithm == "xgboost":
+        forecast = pd.DataFrame()
+        if self.algorithm in ["auto", "xgboost"]:
             self.logger.info("Training XGBoost")
-            model, forecast = self.apply_xgboost_model(data.copy())
-            artifact["models"]["global"] = model
-            artifact["predictions"] = forecast
+            forecast = self.apply_xgboost_model(data.copy())
+            if self.algorithm == "xgboost":
+                artifact["predictions"] = forecast
+                return artifact
 
-        else:
-            raise ValueError(f"Unsupported algorithm: {algorithm}")
+        
+        if "TSId" not in data.columns:
+                raise KeyError("TSId column must be provided!!")
+        forecast_list = []
+        for ts_id, group in data.groupby("TSId", sort=False):
+            self.logger.info("Training Prophet for TSId=%s", ts_id)
+            forecast = self.apply_prophet_model(ts_id, group.copy())
+            forecast_list.append(forecast)
+
+        artifact["predictions"] = pd.concat(forecast_list + list(forecast), ignore_index=True)
 
         return artifact
 
