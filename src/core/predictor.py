@@ -31,10 +31,6 @@ class Predictor:
             self.algorithm = str(artifact.get("algorithm", "")).strip().lower()
             self.frequency = str(artifact.get("frequency", "daily")).strip().lower()
             predictions = artifact.get("predictions")
-        elif isinstance(artifact, pd.DataFrame):
-            self.algorithm = ""
-            self.frequency = "daily"
-            predictions = artifact
         else:
             raise TypeError("Unsupported artifact type for predictor.")
 
